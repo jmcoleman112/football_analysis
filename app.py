@@ -10,6 +10,10 @@ import os
 from werkzeug.utils import secure_filename
 import threading
 import queue
+import logging
+import traceback
+import json
+from flask import make_response
 
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = 'uploads'
@@ -22,29 +26,37 @@ os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 os.makedirs(app.config['OUTPUT_FOLDER'], exist_ok=True)
 
 # Global variables for streaming
-frame_queue = queue.Queue(maxsize=10)
+frame_queue = queue.Queue(maxsize=10)          # main annotated camera frames
+proj_frame_queue = queue.Queue(maxsize=10)     # projection / position map frames
 processing_active = False
 processing_lock = threading.Lock()
+
+# possession shared state (updated by processing thread, read by /possession)
+poss_data = {'club1': 0.5, 'club2': 0.5, 'timestamp': 0.0}
+poss_lock = threading.Lock()
+
+logging.basicConfig(level=logging.INFO)
 
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in app.config['ALLOWED_EXTENSIONS']
 
 def initialize_processor(club1_name, club1_color, club1_gk_color,
-                        club2_name, club2_color, club2_gk_color):
+                        club2_name, club2_color, club2_gk_color,
+                        obj_conf=0.5, ball_conf=0.05, field_conf=0.3, kp_conf=0.7):
     """Initialize all models and processors"""
 
     # 1. Load the object detection model
     obj_tracker = ObjectTracker(
         model_path='models/weights/object-detection.pt',
-        conf=.5,
-        ball_conf=.05
+        conf=obj_conf,
+        ball_conf=ball_conf
     )
 
     # 2. Load the keypoints detection model
     kp_tracker = KeypointsTracker(
         model_path='models/weights/keypoints-detection.pt',
-        conf=.3,
-        kp_conf=.7,
+        conf=field_conf,
+        kp_conf=kp_conf,
     )
 
     # 3. Assign clubs
@@ -83,9 +95,22 @@ def initialize_processor(club1_name, club1_color, club1_gk_color,
 
     return processor
 
+def _make_placeholder_jpeg(text: str = "No frame", width: int = 640, height: int = 360) -> bytes:
+    """
+    Create a simple black image with white text and return JPEG bytes.
+    Used to push a visible frame to the queues on error so the UI shows something.
+    """
+    img = np.zeros((height, width, 3), dtype=np.uint8)
+    cv2.putText(img, text, (10, height // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+    try:
+        _, buf = cv2.imencode('.jpg', img)
+        return buf.tobytes()
+    except Exception:
+        return b''
+
 def process_video_stream(video_path, processor):
     """Process video and stream frames in real-time"""
-    global processing_active
+    global processing_active, poss_data
 
     cap = cv2.VideoCapture(video_path)
 
@@ -101,21 +126,84 @@ def process_video_stream(video_path, processor):
                 break
 
             # Process frame through the processor with proper FPS
-            processed_frame = processor.process_frame(frame, fps)
-
-            # Encode frame as JPEG
-            _, buffer = cv2.imencode('.jpg', processed_frame)
-            frame_bytes = buffer.tobytes()
-
-            # Put frame in queue (drop old frames if queue is full)
             try:
-                frame_queue.put(frame_bytes, block=False)
-            except queue.Full:
+                cam_frame, proj_frame = processor.process_frame(frame, fps)
+
+                # Update latest possession numbers from the processor's ball assigner (if available)
                 try:
-                    frame_queue.get_nowait()
-                    frame_queue.put(frame_bytes, block=False)
+                    possessions = processor.ball_to_player_assigner.get_ball_possessions()
+                    if possessions and len(possessions) > 0:
+                        latest = possessions[-1]
+                        # expected pair (club1_frac, club2_frac)
+                        with poss_lock:
+                            poss_data['club1'] = float(latest[0])
+                            poss_data['club2'] = float(latest[1])
+                            poss_data['timestamp'] = cv2.getTickCount() / cv2.getTickFrequency()
+                except Exception:
+                    # ignore if getter not available or errors
+                    pass
+
+                # Rotate projection to vertical orientation to save horizontal space on UI
+                try:
+                    proj_frame = cv2.rotate(proj_frame, cv2.ROTATE_90_CLOCKWISE)
+                except Exception:
+                    pass
+
+                # Encode camera frame
+                try:
+                    _, cam_buffer = cv2.imencode('.jpg', cam_frame)
+                    cam_bytes = cam_buffer.tobytes()
+                except Exception:
+                    cam_bytes = _make_placeholder_jpeg("Camera encode error")
+
+                # Encode projection frame
+                try:
+                    _, proj_buffer = cv2.imencode('.jpg', proj_frame)
+                    proj_bytes = proj_buffer.tobytes()
+                except Exception:
+                    proj_bytes = _make_placeholder_jpeg("Projection encode error")
+
+                # Put camera frame in queue (drop old frames if queue is full)
+                try:
+                    if cam_bytes:
+                        frame_queue.put(cam_bytes, block=False)
+                except queue.Full:
+                    try:
+                        frame_queue.get_nowait()
+                        frame_queue.put(cam_bytes, block=False)
+                    except:
+                        pass
+
+                # Put projection frame in its queue (drop old frames if queue is full)
+                try:
+                    if proj_bytes:
+                        proj_frame_queue.put(proj_bytes, block=False)
+                except queue.Full:
+                    try:
+                        proj_frame_queue.get_nowait()
+                        proj_frame_queue.put(proj_bytes, block=False)
+                    except:
+                        pass
+
+            except Exception as e:
+                # Log the full traceback, mark processing as stopped and push placeholder frames
+                logging.error("Exception in process_video_stream: %s", e)
+                traceback.print_exc()
+                with processing_lock:
+                    processing_active = False
+
+                # push visible placeholders so client sees an error frame instead of blank
+                err_cam = _make_placeholder_jpeg("Processing error", 640, 360)
+                err_proj = _make_placeholder_jpeg("Processing error", 640, 360)
+                try:
+                    frame_queue.put(err_cam, block=False)
                 except:
                     pass
+                try:
+                    proj_frame_queue.put(err_proj, block=False)
+                except:
+                    pass
+                break
 
     finally:
         cap.release()
@@ -149,6 +237,12 @@ def upload_video():
     club2_color = tuple(map(int, request.form.get('club2_color', '108,38,34').split(',')))
     club2_gk_color = tuple(map(int, request.form.get('club2_gk_color', '211,207,47').split(',')))
 
+    # Get confidence configuration from form
+    obj_conf = float(request.form.get('obj_conf', 0.5))
+    ball_conf = float(request.form.get('ball_conf', 0.05))
+    field_conf = float(request.form.get('field_conf', 0.3))
+    kp_conf = float(request.form.get('kp_conf', 0.7))
+
     # Save uploaded file
     filename = secure_filename(file.filename)
     filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
@@ -158,7 +252,8 @@ def upload_video():
     try:
         processor = initialize_processor(
             club1_name, club1_color, club1_gk_color,
-            club2_name, club2_color, club2_gk_color
+            club2_name, club2_color, club2_gk_color,
+            obj_conf, ball_conf, field_conf, kp_conf
         )
 
         # Start processing in background thread
@@ -179,7 +274,7 @@ def upload_video():
 
 @app.route('/video_feed')
 def video_feed():
-    """Video streaming route"""
+    """Video streaming route (annotated camera frames)"""
     def generate():
         while processing_active or not frame_queue.empty():
             try:
@@ -190,6 +285,29 @@ def video_feed():
                 continue
 
     return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+@app.route('/projection_feed')
+def projection_feed():
+    """Projection / position map streaming route"""
+    def generate():
+        while processing_active or not proj_frame_queue.empty():
+            try:
+                frame = proj_frame_queue.get(timeout=1)
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+            except queue.Empty:
+                continue
+
+    return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+@app.route('/possession')
+def possession():
+    """Return latest possession percentages as JSON (club1, club2)."""
+    with poss_lock:
+        data = {'club1': round(float(poss_data.get('club1', 0.5)), 3),
+                'club2': round(float(poss_data.get('club2', 0.5)), 3),
+                'timestamp': float(poss_data.get('timestamp', 0.0))}
+    return jsonify(data)
 
 @app.route('/stop', methods=['POST'])
 def stop_processing():

@@ -46,19 +46,23 @@ class ProjectionAnnotator(AbstractAnnotator):
             cv2.line(frame, (int(pos[0]), int(pos[1]) - size), (int(pos[0]), int(pos[1]) + size), color=outline_color, thickness=10)
 
 
-    def annotate(self, frame: np.ndarray, tracks: Dict) -> np.ndarray:
+    def annotate(self, frame: np.ndarray, tracks: Dict, use_heatmap: bool = True) -> np.ndarray:
         """
-        Annotates an image with projected player, goalkeeper, referee, and ball positions, along with Voronoi regions.
-        
+        Annotates an image with projected player, goalkeeper, referee, and ball positions, along with Voronoi regions or heatmap.
+
         Parameters:
             frame (np.ndarray): The image on which to draw the annotations.
             tracks (Dict): A dictionary containing tracking information for 'player', 'goalkeeper', 'referee', and 'ball'.
+            use_heatmap (bool): If True, use heatmap visualization instead of Voronoi diagram.
 
         Returns:
             np.ndarray: The annotated frame.
         """
         frame = frame.copy()
-        frame = self._draw_voronoi(frame, tracks)
+        if use_heatmap:
+            frame = self._draw_heatmap(frame, tracks)
+        else:
+            frame = self._draw_voronoi(frame, tracks)
 
         for class_name, track_data in tracks.items():
             if class_name != 'ball':  # Ball is drawn later
@@ -93,6 +97,53 @@ class ProjectionAnnotator(AbstractAnnotator):
                 cv2.line(frame, (int(proj_pos[0]), int(proj_pos[1]) - 10), (int(proj_pos[0]), int(proj_pos[1]) + 10), color=color, thickness=6)
 
         return frame
+
+    # ---------------- new heatmap helper ----------------
+    def _draw_heatmap(self, image: np.ndarray, tracks: Dict) -> np.ndarray:
+        """
+        Build a simple heatmap from projected positions and blend it onto the image.
+        Uses heavier weight for the ball, draws small discs at each projection coordinate,
+        blurs for smoothness, normalizes, applies a colormap and blends it back.
+        """
+        h, w = image.shape[:2]
+        # single-channel float accumulator
+        heat = np.zeros((h, w), dtype=np.float32)
+
+        # radius for drawing spots (relative to image size)
+        rr = max(6, int(min(w, h) * 0.01))
+
+        # Accumulate points: ball gets higher weight
+        for class_name, track_data in tracks.items():
+            for track_id, info in track_data.items():
+                proj = info.get('projection') if isinstance(info, dict) else None
+                if proj is None or len(proj) < 2:
+                    continue
+                x, y = int(proj[0]), int(proj[1])
+                if x < 0 or y < 0 or x >= w or y >= h:
+                    continue
+                weight = 2.0 if class_name == 'ball' else 1.0
+                cv2.circle(heat, (x, y), rr, color=float(weight), thickness=-1)
+
+        # if no points, return original
+        if heat.max() == 0:
+            return image
+
+        # blur for softer heat regions
+        heat_blur = cv2.GaussianBlur(heat, (0, 0), sigmaX=rr * 1.5, sigmaY=rr * 1.5)
+
+        # normalize to 0..255 for colormap
+        minv, maxv = float(np.min(heat_blur)), float(np.max(heat_blur))
+        if maxv - minv < 1e-6:
+            return image
+        norm = ((heat_blur - minv) / (maxv - minv) * 255.0).astype(np.uint8)
+
+        # apply colormap and blend onto image
+        colored = cv2.applyColorMap(norm, cv2.COLORMAP_JET)
+        overlay = image.copy()
+        alpha = 0.6
+        cv2.addWeighted(colored, alpha, overlay, 1.0 - alpha, 0, overlay)
+
+        return overlay
 
     def _draw_voronoi(self, image: np.ndarray, tracks: Dict) -> np.ndarray:
         """
@@ -145,4 +196,3 @@ class ProjectionAnnotator(AbstractAnnotator):
 
 
 
-    
