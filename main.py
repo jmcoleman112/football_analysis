@@ -31,13 +31,13 @@ def main():
     # 3. Assign clubs to players based on their uniforms' colors
     # Create 'Club' objects - Needed for Player Club Assignment
     # Replace the RGB values with the actual colors of the clubs.
-    club1 = Club('Club1',         # club name 
-                 (232, 247, 248), # player jersey color
-                 (6, 25, 21)      # goalkeeper jersey color
+    club1 = Club('Ireland',         # club name
+                 (199, 207, 198), # player jersey color
+                 (11, 136, 194)      # goalkeeper jersey color
                  )
-    club2 = Club('Club2',         # club name 
-                 (172, 251, 145), # player jersey color
-                 (239, 156, 132)  # goalkeeper jersey color
+    club2 = Club('Hungary',         # club name
+                 (108, 38, 34), # player jersey color
+                 (211, 207, 47)  # goalkeeper jersey color
                  )   
 
     # Create a ClubAssigner Object to automatically assign players and goalkeepers 
@@ -69,7 +69,7 @@ def main():
                                        club_assigner,                                 # Created ClubAssigner object
                                        ball_player_assigner,                          # Created BallToPlayerAssigner object
                                        top_down_keypoints,                            # Created Top-Down keypoints numpy array
-                                       field_img_path='input_videos/field_2d_v2.png', # Top-Down field image path
+                                       field_img_path='videos/field_2d_v2.png', # Top-Down field image path
                                        save_tracks_dir='output_videos',               # Directory to save tracking information.
                                        draw_frame_num=True                            # Whether or not to draw current frame number on 
                                                                                       #the output video.
@@ -79,9 +79,9 @@ def main():
     # Specify the input video path and the output video path. 
     # The batch_size determines how many frames are processed in one go.
     process_video(processor,                                # Created FootballVideoProcessor object
-                  video_source='input_videos/video2.mp4', # Video source (in this case video file path)
-                  output_video='output_videos/testx.mp4',    # Output video path (Optional)
-                  batch_size=10                             # Number of frames to process at once
+                  video_source='videos/irelandinput2.mp4', # Video source (in this case video file path)
+                  output_video='videos/irelandoutput2.mp4',    # Output video path (Optional)
+                  batch_size=100                             # Number of frames to process at once
                   )
 
 

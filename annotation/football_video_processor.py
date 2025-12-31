@@ -132,7 +132,58 @@ class FootballVideoProcessor(AbstractAnnotator, AbstractVideoProcessor):
 
         return processed_frames
 
-    
+    def process_frame(self, frame: np.ndarray, fps: float = 30.0) -> np.ndarray:
+        """
+        Processes a single video frame for real-time streaming.
+
+        Args:
+            frame (np.ndarray): Single video frame.
+            fps (float): Frames per second of the video, used for speed estimation.
+
+        Returns:
+            np.ndarray: The annotated video frame.
+        """
+        self.cur_fps = max(fps, 1e-6)
+
+        # Detect objects and keypoints in the single frame
+        obj_detection = self.obj_tracker.detect([frame])[0]
+        kp_detection = self.kp_tracker.detect([frame])[0]
+
+        # Track detected objects and keypoints
+        obj_tracks = self.obj_tracker.track(obj_detection)
+        kp_tracks = self.kp_tracker.track(kp_detection)
+
+        # Assign clubs to players based on their tracked position
+        obj_tracks = self.club_assigner.assign_clubs(frame, obj_tracks)
+
+        all_tracks = {'object': obj_tracks, 'keypoints': kp_tracks}
+
+        # Map objects to a top-down view of the field
+        all_tracks = self.obj_mapper.map(all_tracks)
+
+        # Assign the ball to the closest player and calculate speed
+        all_tracks['object'], _ = self.ball_to_player_assigner.assign(
+            all_tracks['object'], self.frame_num,
+            all_tracks['keypoints'].get(8, None),
+            all_tracks['keypoints'].get(24, None)
+        )
+
+        # Estimate the speed of the tracked objects
+        all_tracks['object'] = self.speed_estimator.calculate_speed(
+            all_tracks['object'], self.frame_num, self.cur_fps
+        )
+
+        # Save tracking information if saving is enabled
+        if self.save_tracks_dir:
+            self._save_tracks(all_tracks)
+
+        self.frame_num += 1
+
+        # Annotate the current frame with the tracking information
+        annotated_frame = self.annotate(frame, all_tracks)
+
+        return annotated_frame
+
     def annotate(self, frame: np.ndarray, tracks: Dict) -> np.ndarray:
         """
         Annotates the given frame with analised data
@@ -245,9 +296,15 @@ class FootballVideoProcessor(AbstractAnnotator, AbstractVideoProcessor):
         bar_height = 15
 
         # Get possession data from the ball-to-player assigner
-        possession = self.ball_to_player_assigner.get_ball_possessions()[-1]
-        possession_club1 = possession[0]
-        possession_club2 = possession[1]
+        possessions = self.ball_to_player_assigner.get_ball_possessions()
+        if len(possessions) > 0:
+            possession = possessions[-1]
+            possession_club1 = possession[0]
+            possession_club2 = possession[1]
+        else:
+            # Default to 50-50 possession if no data available yet
+            possession_club1 = 0.5
+            possession_club2 = 0.5
 
         # Calculate sizes for each possession segment in pixels
         club1_width = int(bar_width * possession_club1)

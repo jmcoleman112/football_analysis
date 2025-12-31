@@ -162,12 +162,12 @@ def process_video(processor = None, video_source: str = 0, output_video: Optiona
                 frame_filename = os.path.join(temp_dir, f"frame_{frame_count:06d}.jpg")
                 cv2.imwrite(frame_filename, processed_frame)
                 
-                cv2.imshow('Football Analysis', processed_frame)
-
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    print("'q' pressed, initiating shutdown")
-                    stop_event.set()
-                    break
+                # cv2.imshow('Football Analysis', processed_frame)
+                #
+                # if cv2.waitKey(1) & 0xFF == ord('q'):
+                #     print("'q' pressed, initiating shutdown")
+                #     stop_event.set()
+                #     break
             except queue.Empty:
                 continue
             except Exception as e:
