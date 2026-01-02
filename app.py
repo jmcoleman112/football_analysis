@@ -35,6 +35,10 @@ processing_lock = threading.Lock()
 poss_data = {'club1': 0.5, 'club2': 0.5, 'timestamp': 0.0}
 poss_lock = threading.Lock()
 
+# projection visualization mode shared state: 'heatmap' | 'voronoi' | 'both'
+projection_mode = 'heatmap'
+projection_lock = threading.Lock()
+
 logging.basicConfig(level=logging.INFO)
 
 def allowed_file(filename):
@@ -110,7 +114,7 @@ def _make_placeholder_jpeg(text: str = "No frame", width: int = 640, height: int
 
 def process_video_stream(video_path, processor):
     """Process video and stream frames in real-time"""
-    global processing_active, poss_data
+    global processing_active, poss_data, projection_mode
 
     cap = cv2.VideoCapture(video_path)
 
@@ -124,6 +128,13 @@ def process_video_stream(video_path, processor):
             ret, frame = cap.read()
             if not ret:
                 break
+
+            # read latest projection_mode and set on processor so annotate respects it
+            try:
+                with projection_lock:
+                    processor.projection_mode = projection_mode
+            except Exception:
+                processor.projection_mode = 'heatmap'
 
             # Process frame through the processor with proper FPS
             try:
@@ -326,6 +337,33 @@ def status():
 def download_output(filename):
     """Download processed video"""
     return send_from_directory(app.config['OUTPUT_FOLDER'], filename)
+
+@app.route('/projection_mode', methods=['GET', 'POST'])
+def projection_mode_api():
+    """GET current projection mode or set it via POST (JSON or form)"""
+    global projection_mode
+    if request.method == 'POST':
+        # try JSON first, then form field
+        data_mode = None
+        try:
+            data = request.get_json(silent=True)
+            if isinstance(data, dict) and 'mode' in data:
+                data_mode = data['mode']
+        except Exception:
+            data_mode = None
+        if data_mode is None:
+            data_mode = request.form.get('projection_mode', None)
+        if data_mode is None:
+            return jsonify({'error': 'no mode supplied'}), 400
+        data_mode = str(data_mode).lower()
+        if data_mode not in ('heatmap', 'voronoi', 'both'):
+            return jsonify({'error': 'invalid mode'}), 400
+        with projection_lock:
+            projection_mode = data_mode
+        return jsonify({'success': True, 'mode': projection_mode})
+    else:
+        with projection_lock:
+            return jsonify({'mode': projection_mode})
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000, threaded=True)

@@ -46,23 +46,24 @@ class ProjectionAnnotator(AbstractAnnotator):
             cv2.line(frame, (int(pos[0]), int(pos[1]) - size), (int(pos[0]), int(pos[1]) + size), color=outline_color, thickness=10)
 
 
-    def annotate(self, frame: np.ndarray, tracks: Dict, use_heatmap: bool = True) -> np.ndarray:
+    def annotate(self, frame: np.ndarray, tracks: Dict, mode: str = 'heatmap') -> np.ndarray:
         """
-        Annotates an image with projected player, goalkeeper, referee, and ball positions, along with Voronoi regions or heatmap.
-
-        Parameters:
-            frame (np.ndarray): The image on which to draw the annotations.
-            tracks (Dict): A dictionary containing tracking information for 'player', 'goalkeeper', 'referee', and 'ball'.
-            use_heatmap (bool): If True, use heatmap visualization instead of Voronoi diagram.
-
-        Returns:
-            np.ndarray: The annotated frame.
+        Annotates an image with projected player, goalkeeper, referee, and ball positions.
+        mode: 'heatmap' | 'voronoi' | 'both'
         """
         frame = frame.copy()
-        if use_heatmap:
+        mode = (mode or 'heatmap').lower()
+        if mode == 'heatmap':
             frame = self._draw_heatmap(frame, tracks)
-        else:
+        elif mode == 'voronoi':
             frame = self._draw_voronoi(frame, tracks)
+        elif mode == 'both':
+            # draw heatmap as base, then overlay voronoi on top
+            base = self._draw_heatmap(frame, tracks)
+            frame = self._draw_voronoi(base, tracks)
+        else:
+            # fallback to heatmap
+            frame = self._draw_heatmap(frame, tracks)
 
         for class_name, track_data in tracks.items():
             if class_name != 'ball':  # Ball is drawn later

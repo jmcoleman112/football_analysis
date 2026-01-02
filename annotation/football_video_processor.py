@@ -174,9 +174,9 @@ class FootballVideoProcessor(AbstractAnnotator, AbstractVideoProcessor):
         camera_frame = self.kp_annotator.annotate(camera_frame, tracks['keypoints'])
         camera_frame = self.obj_annotator.annotate(camera_frame, tracks['object'])
 
-        # Keep projection image free of possession overlay; UI will render possession via JS
-        projection_frame = self.projection_annotator.annotate(self.field_image, tracks['object'])
-
+        # Generate projection according to current processor.projection_mode (defaults to 'heatmap')
+        proj_mode = getattr(self, 'projection_mode', 'heatmap')
+        projection_frame = self.projection_annotator.annotate(self.field_image, tracks['object'], mode=proj_mode)
 
         # If heatmap is enabled, keep heatmap on the camera frame (separate concern)
         if self.draw_heatmap:

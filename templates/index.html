@@ -339,6 +339,14 @@
                                 <p class="info-text">Confidence for field keypoints (corners, lines)</p>
                             </div>
                         </div>
+                        <div style="margin-top:12px;">
+                            <label style="display:block; margin-bottom:8px; font-weight:600; color:#333;">Projection Visualization</label>
+                            <select name="projection_mode" id="projectionModeSelect" style="width:100%; padding:10px; border-radius:8px; border:2px solid #ddd;">
+                                <option value="heatmap" selected>Heatmap</option>
+                                <option value="voronoi">Voronoi</option>
+                                <option value="both">Both (heatmap + voronoi)</option>
+                            </select>
+                        </div>
                     </div>
 
                     <div class="controls">
@@ -393,6 +401,7 @@
         const posRight = document.getElementById('posRight');
         const posLeftText = document.getElementById('posLeftText');
         const posRightText = document.getElementById('posRightText');
+        const projectionModeSelect = document.getElementById('projectionModeSelect');
 
         // Update confidence slider values
         const objConf = document.getElementById('objConf');
@@ -415,6 +424,20 @@
         });
         kpConf.addEventListener('input', (e) => {
             kpConfValue.textContent = parseFloat(e.target.value).toFixed(2);
+        });
+
+        // Send projection mode change to server while streaming
+        projectionModeSelect.addEventListener('change', async (e) => {
+            const mode = e.target.value;
+            try {
+                await fetch('/projection_mode', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ mode })
+                });
+            } catch (err) {
+                console.error('Failed to set projection mode', err);
+            }
         });
 
         uploadForm.addEventListener('submit', async (e) => {
