@@ -346,6 +346,12 @@
                                 <option value="voronoi">Voronoi</option>
                                 <option value="both">Both (heatmap + voronoi)</option>
                             </select>
+
+                            <!-- Draw keypoints toggle -->
+                            <div style="margin-top:10px; display:flex; align-items:center; gap:8px;">
+                                <input type="checkbox" id="drawKeypoints" name="draw_keypoints" checked>
+                                <label for="drawKeypoints" style="font-weight:600; color:#333;">Draw keypoints on video</label>
+                            </div>
                         </div>
                     </div>
 
@@ -437,6 +443,21 @@
                 });
             } catch (err) {
                 console.error('Failed to set projection mode', err);
+            }
+        });
+
+        // draw keypoints toggle sends immediate update to server
+        const drawKeypointsCheckbox = document.getElementById('drawKeypoints');
+        drawKeypointsCheckbox.addEventListener('change', async (e) => {
+            const draw = e.target.checked;
+            try {
+                await fetch('/draw_keypoints', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ draw })
+                });
+            } catch (err) {
+                console.error('Failed to set draw_keypoints', err);
             }
         });
 

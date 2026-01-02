@@ -47,6 +47,10 @@ club_colors_lock = threading.Lock()
 projection_mode = 'heatmap'
 projection_lock = threading.Lock()
 
+# draw_keypoints shared state (enable/disable drawing keypoints on camera frame)
+draw_keypoints = True
+draw_keypoints_lock = threading.Lock()
+
 logging.basicConfig(level=logging.INFO)
 
 def allowed_file(filename):
@@ -62,7 +66,8 @@ def rgb_tuple_to_hex(t: tuple) -> str:
 
 def initialize_processor(club1_name, club1_color, club1_gk_color,
                         club2_name, club2_color, club2_gk_color,
-                        obj_conf=0.5, ball_conf=0.05, field_conf=0.3, kp_conf=0.7):
+                        obj_conf=0.5, ball_conf=0.05, field_conf=0.3, kp_conf=0.7,
+                        draw_kp: bool = True):
     """Initialize all models and processors"""
 
     # 1. Load the object detection model
@@ -110,7 +115,9 @@ def initialize_processor(club1_name, club1_color, club1_gk_color,
         top_down_keypoints,
         field_img_path='videos/field_2d_v2.png',
         save_tracks_dir=app.config['OUTPUT_FOLDER'],
-        draw_frame_num=True
+        draw_frame_num=True,
+        draw_heatmap=False,
+        draw_keypoints=draw_kp
     )
 
     return processor
@@ -130,7 +137,7 @@ def _make_placeholder_jpeg(text: str = "No frame", width: int = 640, height: int
 
 def process_video_stream(video_path, processor):
     """Process video and stream frames in real-time"""
-    global processing_active, poss_data, projection_mode, club_colors, poss_seconds
+    global processing_active, poss_data, projection_mode, club_colors, poss_seconds, draw_keypoints
 
     cap = cv2.VideoCapture(video_path)
 
@@ -151,6 +158,14 @@ def process_video_stream(video_path, processor):
                     processor.projection_mode = projection_mode
             except Exception:
                 processor.projection_mode = 'heatmap'
+
+            # read latest draw_keypoints flag so annotate respects it
+            try:
+                with draw_keypoints_lock:
+                    processor.draw_keypoints = draw_keypoints
+            except Exception:
+                # ensure a default exists
+                processor.draw_keypoints = True
 
             # Process frame through the processor with proper FPS
             try:
@@ -454,6 +469,36 @@ def projection_mode_api():
     else:
         with projection_lock:
             return jsonify({'mode': projection_mode})
+
+@app.route('/draw_keypoints', methods=['GET', 'POST'])
+def draw_keypoints_api():
+    """GET/POST to control whether keypoints are drawn on camera frames."""
+    global draw_keypoints
+    if request.method == 'POST':
+        data_draw = None
+        try:
+            data = request.get_json(silent=True)
+            if isinstance(data, dict) and 'draw' in data:
+                data_draw = data['draw']
+        except Exception:
+            data_draw = None
+        if data_draw is None:
+            # fall back to form field
+            val = request.form.get('draw_keypoints', None)
+            if val is None:
+                return jsonify({'error': 'no draw value supplied'}), 400
+            # checkbox yields 'on' when checked
+            data_draw = str(val).lower() in ('1', 'true', 'on', 'yes')
+        else:
+            # coerce JSON boolean-like values
+            data_draw = bool(data_draw)
+
+        with draw_keypoints_lock:
+            draw_keypoints = data_draw
+        return jsonify({'success': True, 'draw_keypoints': draw_keypoints})
+    else:
+        with draw_keypoints_lock:
+            return jsonify({'draw_keypoints': draw_keypoints})
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000, threaded=True)

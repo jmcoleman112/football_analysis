@@ -34,7 +34,7 @@ class FootballVideoProcessor(AbstractAnnotator, AbstractVideoProcessor):
                  top_down_keypoints: np.ndarray, field_img_path: str,
                  save_tracks_dir: Optional[str] = None, draw_frame_num: bool = False,
                  draw_heatmap: bool = False, heatmap_opacity: float = 0.6,
-                 heatmap_colormap: int = cv2.COLORMAP_JET) -> None:
+                 heatmap_colormap: int = cv2.COLORMAP_JET, draw_keypoints: bool = True) -> None:
 
         self.obj_tracker = obj_tracker
         self.obj_annotator = ObjectAnnotator()
@@ -46,6 +46,9 @@ class FootballVideoProcessor(AbstractAnnotator, AbstractVideoProcessor):
         self.obj_mapper = ObjectPositionMapper(top_down_keypoints)
         # frame number overlay disabled by default; keep flag for backward compatibility
         self.draw_frame_num = draw_frame_num
+
+        # whether to draw keypoints on camera frame
+        self.draw_keypoints = bool(draw_keypoints)
 
         if save_tracks_dir:
             self.save_tracks_dir = save_tracks_dir
@@ -167,7 +170,11 @@ class FootballVideoProcessor(AbstractAnnotator, AbstractVideoProcessor):
         # Prepare annotated camera frame (no projection compositing)
         camera_frame = frame.copy()
         # frame number overlay removed — do not draw frame number here
-        camera_frame = self.kp_annotator.annotate(camera_frame, tracks['keypoints'])
+
+        # draw keypoints only if enabled
+        if getattr(self, 'draw_keypoints', True):
+            camera_frame = self.kp_annotator.annotate(camera_frame, tracks['keypoints'])
+
         camera_frame = self.obj_annotator.annotate(camera_frame, tracks['object'])
 
         # Generate projection according to current processor.projection_mode (defaults to 'heatmap')
