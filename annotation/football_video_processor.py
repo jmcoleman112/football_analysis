@@ -16,6 +16,12 @@ import cv2
 import numpy as np
 from typing import List, Dict, Optional, Tuple
 
+# new imports for timing/logging
+import time
+import os
+import threading
+import csv
+
 
 class FootballVideoProcessor(AbstractAnnotator, AbstractVideoProcessor):
     """
@@ -74,38 +80,55 @@ class FootballVideoProcessor(AbstractAnnotator, AbstractVideoProcessor):
         self.heatmap_colormap = heatmap_colormap
         self._heatmap_accum: Optional[np.ndarray] = None  # float32 accumulator
 
+        # ------- timing/logging state -------
+        # path where timing CSV will be stored (if save_tracks_dir provided)
+        self._timing_lock = threading.Lock()
+        if save_tracks_dir:
+            # ensure dir exists
+            os.makedirs(save_tracks_dir, exist_ok=True)
+            self._timing_path = os.path.join(save_tracks_dir, 'timings.csv')
+        else:
+            self._timing_path = None
+
     def process(self, frames: List[np.ndarray], fps: float = 1e-6) -> List[np.ndarray]:
         self.cur_fps = max(fps, 1e-6)
 
-        # Detect objects and keypoints in all frames
+        # time the batch inference (object + kp) as one block
+        t_batch_start = time.perf_counter()
         batch_obj_detections = self.obj_tracker.detect(frames)
         batch_kp_detections = self.kp_tracker.detect(frames)
+        t_batch_infer_end = time.perf_counter()
+        batch_inference_time = t_batch_infer_end - t_batch_start
 
         processed_frames = []
 
         # Process each frame in the batch
         for idx, (frame, object_detection, kp_detection) in enumerate(zip(frames, batch_obj_detections, batch_kp_detections)):
 
-            # Track detected objects and keypoints
+            t0 = time.perf_counter()
+
+            # small pre-processing time: time between t0 and using detection results
+            t_pre_end = time.perf_counter()
+            pre_time = t_pre_end - t0
+
+            # Tracking & post-inference processing
+            t_mid_start = time.perf_counter()
             obj_tracks = self.obj_tracker.track(object_detection)
             kp_tracks = self.kp_tracker.track(kp_detection)
 
-            # Assign clubs to players based on their tracked position
+            # Assign clubs
             obj_tracks = self.club_assigner.assign_clubs(frame, obj_tracks)
-
             all_tracks = {'object': obj_tracks, 'keypoints': kp_tracks}
 
-            # Map objects to a top-down view of the field
+            # Map objects to top-down
             all_tracks = self.obj_mapper.map(all_tracks)
 
-            # Assign the ball to the closest player and calculate speed
+            # Ball assignment and speed estimation
             all_tracks['object'], _ = self.ball_to_player_assigner.assign(
                 all_tracks['object'], self.frame_num,
                 all_tracks['keypoints'].get(8, None),  # keypoint for player 1
                 all_tracks['keypoints'].get(24, None)  # keypoint for player 2
             )
-
-            # Estimate the speed of the tracked objects
             all_tracks['object'] = self.speed_estimator.calculate_speed(
                 all_tracks['object'], self.frame_num, self.cur_fps
             )
@@ -114,11 +137,41 @@ class FootballVideoProcessor(AbstractAnnotator, AbstractVideoProcessor):
             if self.save_tracks_dir:
                 self._save_tracks(all_tracks)
 
+            t_mid_end = time.perf_counter()
+            mid_time = t_mid_end - t_mid_start
+
             self.frame_num += 1
 
-            # Annotate the current frame with the tracking information
+            # Annotate
+            t_annot_start = time.perf_counter()
             annotated_frame, projection_frame = self.annotate(frame, all_tracks)
-            # Append a tuple (camera_frame, projection_frame) so callers can handle them separately
+            t_annot_end = time.perf_counter()
+            annot_time = t_annot_end - t_annot_start
+
+            total_time = t_annot_end - t0
+            # For inference time per-frame approximate from batch inference divided by frames (safe fallback)
+            infer_time = batch_inference_time / max(len(frames), 1)
+
+            fps_est = 1.0 / max(total_time, 1e-9)
+
+            # Compose log row and write
+            try:
+                log_row = {
+                    'frame_num': int(self.frame_num - 1),
+                    'timestamp': float(time.time()),
+                    'pre_s': pre_time,
+                    'inference_s': infer_time,
+                    'mid_s': mid_time,
+                    'annotate_s': annot_time,
+                    'total_s': total_time,
+                    'fps_est': fps_est,
+                    'object_count': int(len(all_tracks.get('object', {})))
+                }
+                self._append_timing(log_row)
+            except Exception:
+                pass
+
+            # Append a tuple (camera_frame, projection_frame)
             processed_frames.append((annotated_frame, projection_frame))
 
         return processed_frames
@@ -126,11 +179,22 @@ class FootballVideoProcessor(AbstractAnnotator, AbstractVideoProcessor):
     def process_frame(self, frame: np.ndarray, fps: float = 30.0) -> np.ndarray:
         self.cur_fps = max(fps, 1e-6)
 
-        # Detect objects and keypoints in the single frame
+        # overall start
+        t0 = time.perf_counter()
+
+        # pre-processing (if any) - trivial here
+        t_pre_end = time.perf_counter()
+        pre_time = t_pre_end - t0
+
+        # Detect objects and keypoints in the single frame (inference)
+        t_infer_start = time.perf_counter()
         obj_detection = self.obj_tracker.detect([frame])[0]
         kp_detection = self.kp_tracker.detect([frame])[0]
+        t_infer_end = time.perf_counter()
+        infer_time = t_infer_end - t_infer_start
 
-        # Track detected objects and keypoints
+        # Track detected objects and keypoints + mapping + assignment + speed
+        t_mid_start = time.perf_counter()
         obj_tracks = self.obj_tracker.track(obj_detection)
         kp_tracks = self.kp_tracker.track(kp_detection)
 
@@ -158,10 +222,36 @@ class FootballVideoProcessor(AbstractAnnotator, AbstractVideoProcessor):
         if self.save_tracks_dir:
             self._save_tracks(all_tracks)
 
+        t_mid_end = time.perf_counter()
+        mid_time = t_mid_end - t_mid_start
+
         self.frame_num += 1
 
         # Annotate the current frame with the tracking information
+        t_annot_start = time.perf_counter()
         annotated_frame, projection_frame = self.annotate(frame, all_tracks)
+        t_annot_end = time.perf_counter()
+        annot_time = t_annot_end - t_annot_start
+
+        total_time = t_annot_end - t0
+        fps_est = 1.0 / max(total_time, 1e-9)
+
+        # Write timing row to CSV if configured
+        try:
+            log_row = {
+                'frame_num': int(self.frame_num - 1),
+                'timestamp': float(time.time()),
+                'pre_s': pre_time,
+                'inference_s': infer_time,
+                'mid_s': mid_time,
+                'annotate_s': annot_time,
+                'total_s': total_time,
+                'fps_est': fps_est,
+                'object_count': int(len(all_tracks.get('object', {})))
+            }
+            self._append_timing(log_row)
+        except Exception:
+            pass
 
         # Return both frames so the caller (e.g. app) can display them separately
         return annotated_frame, projection_frame
@@ -400,3 +490,21 @@ class FootballVideoProcessor(AbstractAnnotator, AbstractVideoProcessor):
         # Blend colored heatmap onto frame
         overlay = cv2.addWeighted(frame, 1.0 - self.heatmap_opacity, colored, self.heatmap_opacity, 0)
         return overlay
+
+    def _append_timing(self, row: Dict) -> None:
+        """Append a timing row to the CSV timings file (thread-safe)."""
+        if not self._timing_path:
+            return
+        with self._timing_lock:
+            write_header = not os.path.exists(self._timing_path)
+            try:
+                with open(self._timing_path, 'a', newline='') as csvfile:
+                    fieldnames = ['frame_num', 'timestamp', 'pre_s', 'inference_s', 'mid_s', 'annotate_s', 'total_s', 'fps_est', 'object_count']
+                    writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                    if write_header:
+                        writer.writeheader()
+                    writer.writerow(row)
+            except Exception:
+                # never crash the processor on logging failure
+                pass
+

@@ -51,6 +51,9 @@ projection_lock = threading.Lock()
 draw_keypoints = True
 draw_keypoints_lock = threading.Lock()
 
+# Global for current processor to enable exporting logs
+current_processor = None
+
 logging.basicConfig(level=logging.INFO)
 
 def allowed_file(filename):
@@ -282,7 +285,7 @@ def index():
 @app.route('/upload', methods=['POST'])
 def upload_video():
     """Handle video upload and start processing"""
-    global processing_active, club_colors, poss_seconds
+    global processing_active, club_colors, poss_seconds, current_processor
 
     if 'video' not in request.files:
         return jsonify({'error': 'No video file provided'}), 400
@@ -326,6 +329,9 @@ def upload_video():
         with club_colors_lock:
             club_colors['club1'] = club1_color
             club_colors['club2'] = club2_color
+
+        # set global current processor so we can export logs later
+        current_processor = processor
 
         # Temporary initialization: give each team 30 seconds possession at load
         with poss_seconds_lock:
@@ -442,6 +448,22 @@ def status():
 def download_output(filename):
     """Download processed video"""
     return send_from_directory(app.config['OUTPUT_FOLDER'], filename)
+
+# New endpoint to export timings CSV
+@app.route('/export_log', methods=['GET'])
+def export_log():
+    """Download timings CSV (timings.csv) from the current processor output folder."""
+    global current_processor
+    if current_processor is None:
+        return jsonify({'error': 'No processor initialized'}), 404
+
+    timings_filename = 'timings.csv'
+    timings_path = os.path.join(app.config['OUTPUT_FOLDER'], timings_filename)
+    if not os.path.exists(timings_path):
+        return jsonify({'error': 'timings file not found', 'path': timings_path}), 404
+
+    # send file as attachment for download
+    return send_from_directory(app.config['OUTPUT_FOLDER'], timings_filename, as_attachment=True)
 
 @app.route('/projection_mode', methods=['GET', 'POST'])
 def projection_mode_api():
