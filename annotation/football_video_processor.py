@@ -6,7 +6,6 @@ from .keypoints_annotator import KeypointsAnnotator
 from .projection_annotator import ProjectionAnnotator
 from position_mappers import ObjectPositionMapper
 from speed_estimation import SpeedEstimator
-from .frame_number_annotator import FrameNumberAnnotator
 from file_writing import TracksJsonWriter
 from tracking import ObjectTracker, KeypointsTracker
 from club_assignment import ClubAssigner
@@ -33,7 +32,7 @@ class FootballVideoProcessor(AbstractAnnotator, AbstractVideoProcessor):
     def __init__(self, obj_tracker: ObjectTracker, kp_tracker: KeypointsTracker,
                  club_assigner: ClubAssigner, ball_to_player_assigner: BallToPlayerAssigner,
                  top_down_keypoints: np.ndarray, field_img_path: str,
-                 save_tracks_dir: Optional[str] = None, draw_frame_num: bool = True,
+                 save_tracks_dir: Optional[str] = None, draw_frame_num: bool = False,
                  draw_heatmap: bool = False, heatmap_opacity: float = 0.6,
                  heatmap_colormap: int = cv2.COLORMAP_JET) -> None:
 
@@ -45,9 +44,8 @@ class FootballVideoProcessor(AbstractAnnotator, AbstractVideoProcessor):
         self.ball_to_player_assigner = ball_to_player_assigner
         self.projection_annotator = ProjectionAnnotator()
         self.obj_mapper = ObjectPositionMapper(top_down_keypoints)
+        # frame number overlay disabled by default; keep flag for backward compatibility
         self.draw_frame_num = draw_frame_num
-        if self.draw_frame_num:
-            self.frame_num_annotator = FrameNumberAnnotator()
 
         if save_tracks_dir:
             self.save_tracks_dir = save_tracks_dir
@@ -168,9 +166,7 @@ class FootballVideoProcessor(AbstractAnnotator, AbstractVideoProcessor):
     def annotate(self, frame: np.ndarray, tracks: Dict) -> np.ndarray:
         # Prepare annotated camera frame (no projection compositing)
         camera_frame = frame.copy()
-        if self.draw_frame_num:
-            camera_frame = self.frame_num_annotator.annotate(camera_frame, {'frame_num': self.frame_num})
-
+        # frame number overlay removed — do not draw frame number here
         camera_frame = self.kp_annotator.annotate(camera_frame, tracks['keypoints'])
         camera_frame = self.obj_annotator.annotate(camera_frame, tracks['object'])
 

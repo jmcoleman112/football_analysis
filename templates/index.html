@@ -508,12 +508,21 @@
                 const resp = await fetch('/possession');
                 if (resp.ok) {
                     const p = await resp.json();
-                    const left = Math.round((p.club1 || 0.5) * 100);
-                    const right = Math.round((p.club2 || 0.5) * 100);
-                    posLeft.style.width = left + '%';
-                    posRight.style.width = right + '%';
-                    posLeftText.textContent = left + '%';
-                    posRightText.textContent = right + '%';
+                    // normalize and compute integer percent for left
+                    const leftPct = Math.round((p.club1 || 0.5) * 100);
+                    const rightPct = 100 - leftPct; // ensure fills exactly 100%
+
+                    // apply widths
+                    posLeft.style.width = leftPct + '%';
+                    posRight.style.width = rightPct + '%';
+
+                    // apply colors if provided
+                    if (p.club1_color) posLeft.style.background = p.club1_color;
+                    if (p.club2_color) posRight.style.background = p.club2_color;
+
+                    // update texts
+                    posLeftText.textContent = leftPct + '%';
+                    posRightText.textContent = rightPct + '%';
                 }
             } catch (e) {
                 // ignore polling errors

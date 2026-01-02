@@ -35,6 +35,14 @@ processing_lock = threading.Lock()
 poss_data = {'club1': 0.5, 'club2': 0.5, 'timestamp': 0.0}
 poss_lock = threading.Lock()
 
+# possession (seconds) store for temporary initialization and accumulation
+poss_seconds = {'club1': 0.0, 'club2': 0.0}
+poss_seconds_lock = threading.Lock()
+
+# store the currently configured team colors (R,G,B tuples)
+club_colors = {'club1': (199, 207, 198), 'club2': (108, 38, 34)}
+club_colors_lock = threading.Lock()
+
 # projection visualization mode shared state: 'heatmap' | 'voronoi' | 'both'
 projection_mode = 'heatmap'
 projection_lock = threading.Lock()
@@ -43,6 +51,14 @@ logging.basicConfig(level=logging.INFO)
 
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in app.config['ALLOWED_EXTENSIONS']
+
+def rgb_tuple_to_hex(t: tuple) -> str:
+    """Convert (R,G,B) tuple to hex string for CSS (assumes 0-255 ints)."""
+    try:
+        r, g, b = int(t[0]), int(t[1]), int(t[2])
+        return f'#{r:02x}{g:02x}{b:02x}'
+    except Exception:
+        return '#ffffff'
 
 def initialize_processor(club1_name, club1_color, club1_gk_color,
                         club2_name, club2_color, club2_gk_color,
@@ -114,7 +130,7 @@ def _make_placeholder_jpeg(text: str = "No frame", width: int = 640, height: int
 
 def process_video_stream(video_path, processor):
     """Process video and stream frames in real-time"""
-    global processing_active, poss_data, projection_mode
+    global processing_active, poss_data, projection_mode, club_colors, poss_seconds
 
     cap = cv2.VideoCapture(video_path)
 
@@ -146,9 +162,33 @@ def process_video_stream(video_path, processor):
                     if possessions and len(possessions) > 0:
                         latest = possessions[-1]
                         # expected pair (club1_frac, club2_frac)
-                        with poss_lock:
-                            poss_data['club1'] = float(latest[0])
-                            poss_data['club2'] = float(latest[1])
+                        raw_c1 = float(latest[0]) if len(latest) > 0 else 0.5
+                        raw_c2 = float(latest[1]) if len(latest) > 1 else 0.5
+
+                        # clamp and normalize so sum == 1.0 (fractions for this frame)
+                        raw_c1 = max(0.0, min(1.0, raw_c1))
+                        raw_c2 = max(0.0, min(1.0, raw_c2))
+                        s = raw_c1 + raw_c2
+                        if s <= 1e-6:
+                            frac1, frac2 = 0.5, 0.5
+                        else:
+                            frac1, frac2 = raw_c1 / s, raw_c2 / s
+
+                        # accumulate possession seconds (delta = 1/fps)
+                        delta = 1.0 / max(fps, 1e-6)
+                        with poss_seconds_lock:
+                            poss_seconds['club1'] = poss_seconds.get('club1', 0.0) + frac1 * delta
+                            poss_seconds['club2'] = poss_seconds.get('club2', 0.0) + frac2 * delta
+
+                        # update poss_data snapshots for backward compatibility (normalize seconds -> fractions)
+                        with poss_lock, poss_seconds_lock:
+                            ssec = poss_seconds.get('club1', 0.0) + poss_seconds.get('club2', 0.0)
+                            if ssec <= 1e-6:
+                                poss_data['club1'] = 0.5
+                                poss_data['club2'] = 0.5
+                            else:
+                                poss_data['club1'] = poss_seconds['club1'] / ssec
+                                poss_data['club2'] = poss_seconds['club2'] / ssec
                             poss_data['timestamp'] = cv2.getTickCount() / cv2.getTickFrequency()
                 except Exception:
                     # ignore if getter not available or errors
@@ -227,7 +267,7 @@ def index():
 @app.route('/upload', methods=['POST'])
 def upload_video():
     """Handle video upload and start processing"""
-    global processing_active
+    global processing_active, club_colors, poss_seconds
 
     if 'video' not in request.files:
         return jsonify({'error': 'No video file provided'}), 400
@@ -266,6 +306,26 @@ def upload_video():
             club2_name, club2_color, club2_gk_color,
             obj_conf, ball_conf, field_conf, kp_conf
         )
+
+        # store chosen club colors for the web UI
+        with club_colors_lock:
+            club_colors['club1'] = club1_color
+            club_colors['club2'] = club2_color
+
+        # Temporary initialization: give each team 30 seconds possession at load
+        with poss_seconds_lock:
+            poss_seconds['club1'] = 30.0
+            poss_seconds['club2'] = 30.0
+        # sync poss_data snapshot for UI
+        with poss_lock, poss_seconds_lock:
+            ssec = poss_seconds['club1'] + poss_seconds['club2']
+            if ssec <= 1e-6:
+                poss_data['club1'] = 0.5
+                poss_data['club2'] = 0.5
+            else:
+                poss_data['club1'] = poss_seconds['club1'] / ssec
+                poss_data['club2'] = poss_seconds['club2'] / ssec
+            poss_data['timestamp'] = cv2.getTickCount() / cv2.getTickFrequency()
 
         # Start processing in background thread
         with processing_lock:
@@ -313,12 +373,42 @@ def projection_feed():
 
 @app.route('/possession')
 def possession():
-    """Return latest possession percentages as JSON (club1, club2)."""
-    with poss_lock:
-        data = {'club1': round(float(poss_data.get('club1', 0.5)), 3),
-                'club2': round(float(poss_data.get('club2', 0.5)), 3),
-                'timestamp': float(poss_data.get('timestamp', 0.0))}
-    return jsonify(data)
+    """Return latest possession percentages as JSON (club1, club2) and colors."""
+    # compute percentages from accumulated seconds (preferred), fall back to poss_data
+    with poss_seconds_lock:
+        s1 = float(poss_seconds.get('club1', 0.0))
+        s2 = float(poss_seconds.get('club2', 0.0))
+    ssum = s1 + s2
+    if ssum > 1e-6:
+        c1n = s1 / ssum
+        c2n = s2 / ssum
+        timestamp = cv2.getTickCount() / cv2.getTickFrequency()
+    else:
+        with poss_lock:
+            c1 = float(poss_data.get('club1', 0.5))
+            c2 = float(poss_data.get('club2', 0.5))
+        s = max(1e-6, c1 + c2)
+        c1n = c1 / s
+        c2n = c2 / s
+        timestamp = float(poss_data.get('timestamp', 0.0))
+
+    with club_colors_lock:
+        col1 = club_colors.get('club1', (199, 207, 198))
+        col2 = club_colors.get('club2', (108, 38, 34))
+        col1_hex = rgb_tuple_to_hex(col1)
+        col2_hex = rgb_tuple_to_hex(col2)
+
+    return jsonify({
+        'club1': round(c1n, 3),
+        'club2': round(c2n, 3),
+        'timestamp': timestamp,
+        'club1_color': col1_hex,
+        'club2_color': col2_hex,
+        'club1_percent': int(round(c1n * 100)),
+        'club2_percent': int(round(c2n * 100)),
+        'club1_seconds': round(s1, 2),
+        'club2_seconds': round(s2, 2)
+    })
 
 @app.route('/stop', methods=['POST'])
 def stop_processing():
