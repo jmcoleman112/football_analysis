@@ -352,6 +352,23 @@
                                 <input type="checkbox" id="drawKeypoints" name="draw_keypoints" checked>
                                 <label for="drawKeypoints" style="font-weight:600; color:#333;">Draw keypoints on video</label>
                             </div>
+
+                            <!-- New: Processing Mode selector -->
+                            <div style="margin-top:12px;">
+                                <label style="display:block; margin-bottom:8px; font-weight:600; color:#333;">Processing Mode</label>
+                                <select name="processing_mode" id="processingModeSelect" style="width:100%; padding:10px; border-radius:8px; border:2px solid #ddd;">
+                                    <option value="quality" selected>Mode A (Quality) — detect every frame</option>
+                                    <option value="balanced">Mode B (Balanced) — detect every 3rd frame, track between</option>
+                                    <option value="speed">Mode C (Speed) — detect every 5th frame, track between</option>
+                                </select>
+                            </div>
+
+                            <!-- New: Input resolution scale slider -->
+                            <div style="margin-top:12px;">
+                                <label style="display:block; margin-bottom:8px; font-weight:600; color:#333;">Input Resolution Scale: <span id="scaleValue">100%</span></label>
+                                <input type="range" id="resolutionScale" name="input_scale" min="0.25" max="1.0" step="0.05" value="1.0">
+                                <p class="info-text">Lower values speed up processing at the cost of detection detail.</p>
+                            </div>
                         </div>
                     </div>
 
@@ -408,6 +425,9 @@
         const posLeftText = document.getElementById('posLeftText');
         const posRightText = document.getElementById('posRightText');
         const projectionModeSelect = document.getElementById('projectionModeSelect');
+        const processingModeSelect = document.getElementById('processingModeSelect');
+        const resolutionScale = document.getElementById('resolutionScale');
+        const scaleValue = document.getElementById('scaleValue');
 
         // Update confidence slider values
         const objConf = document.getElementById('objConf');
@@ -432,6 +452,13 @@
             kpConfValue.textContent = parseFloat(e.target.value).toFixed(2);
         });
 
+        // update scale label
+        scaleValue.textContent = Math.round(parseFloat(resolutionScale.value) * 100) + '%';
+        resolutionScale.addEventListener('input', (e) => {
+            const v = parseFloat(e.target.value);
+            scaleValue.textContent = Math.round(v * 100) + '%';
+        });
+
         // Send projection mode change to server while streaming
         projectionModeSelect.addEventListener('change', async (e) => {
             const mode = e.target.value;
@@ -443,6 +470,34 @@
                 });
             } catch (err) {
                 console.error('Failed to set projection mode', err);
+            }
+        });
+
+        // Send processing mode change live
+        processingModeSelect.addEventListener('change', async (e) => {
+            const mode = e.target.value;
+            try {
+                await fetch('/processing_mode', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ mode })
+                });
+            } catch (err) {
+                console.error('Failed to set processing mode', err);
+            }
+        });
+
+        // Send input scale change live
+        resolutionScale.addEventListener('change', async (e) => {
+            const scale = parseFloat(e.target.value);
+            try {
+                await fetch('/input_scale', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ scale })
+                });
+            } catch (err) {
+                console.error('Failed to set input scale', err);
             }
         });
 
@@ -491,6 +546,25 @@
                         projectionStream.src = '/projection_feed?' + new Date().getTime();
                         videoContainer.classList.add('active');
                         streamControls.style.display = 'flex';
+
+                        // after starting, push live processing_mode and input_scale to server
+                        (async () => {
+                            try {
+                                await fetch('/processing_mode', {
+                                    method: 'POST',
+                                    headers: { 'Content-Type': 'application/json' },
+                                    body: JSON.stringify({ mode: processingModeSelect.value })
+                                });
+                                await fetch('/input_scale', {
+                                    method: 'POST',
+                                    headers: { 'Content-Type': 'application/json' },
+                                    body: JSON.stringify({ scale: parseFloat(resolutionScale.value) })
+                                });
+                            } catch (e) {
+                                console.warn('Failed to push live mode/scale', e);
+                            }
+                        })();
+
                     }, 1000);
 
                 } else {

@@ -51,6 +51,15 @@ projection_lock = threading.Lock()
 draw_keypoints = True
 draw_keypoints_lock = threading.Lock()
 
+# Processing performance / optimization state
+# processing_mode: 'quality' | 'balanced' | 'speed'
+processing_mode = 'quality'
+processing_mode_lock = threading.Lock()
+
+# input resolution scale applied before detection/tracking (0.25 .. 1.0)
+input_scale = 1.0
+input_scale_lock = threading.Lock()
+
 # Global for current processor to enable exporting logs
 current_processor = None
 
@@ -123,6 +132,10 @@ def initialize_processor(club1_name, club1_color, club1_gk_color,
         draw_keypoints=draw_kp
     )
 
+    # apply initial optimization settings (will be overriden live via endpoints)
+    processor.input_scale = float(1.0)
+    processor.detection_interval = 1
+
     return processor
 
 def _make_placeholder_jpeg(text: str = "No frame", width: int = 640, height: int = 360) -> bytes:
@@ -141,6 +154,7 @@ def _make_placeholder_jpeg(text: str = "No frame", width: int = 640, height: int
 def process_video_stream(video_path, processor):
     """Process video and stream frames in real-time"""
     global processing_active, poss_data, projection_mode, club_colors, poss_seconds, draw_keypoints
+    global processing_mode, input_scale
 
     cap = cv2.VideoCapture(video_path)
 
@@ -148,6 +162,8 @@ def process_video_stream(video_path, processor):
     fps = cap.get(cv2.CAP_PROP_FPS)
     if fps == 0 or fps is None:
         fps = 30.0  # Default to 30 FPS if unable to detect
+
+    frame_idx = 0
 
     try:
         while cap.isOpened() and processing_active:
@@ -167,112 +183,145 @@ def process_video_stream(video_path, processor):
                 with draw_keypoints_lock:
                     processor.draw_keypoints = draw_keypoints
             except Exception:
-                # ensure a default exists
                 processor.draw_keypoints = True
 
-            # Process frame through the processor with proper FPS
+            # read current processing_mode and input_scale
             try:
-                cam_frame, proj_frame = processor.process_frame(frame, fps)
+                with processing_mode_lock:
+                    pmode = processing_mode
+            except Exception:
+                pmode = 'quality'
+            try:
+                with input_scale_lock:
+                    scale = float(input_scale)
+            except Exception:
+                scale = 1.0
 
-                # Update latest possession numbers from the processor's ball assigner (if available)
+            # map mode -> detection interval
+            if pmode == 'quality':
+                interval = 1
+            elif pmode == 'balanced':
+                interval = 3   # detect every 3rd frame (tuneable)
+            elif pmode == 'speed':
+                interval = 5
+            else:
+                interval = 1
+
+            # prepare frame for processor (apply input scaling if requested)
+            h, w = frame.shape[:2]
+            proc_frame = frame
+            did_resize = False
+            if scale > 0 and scale < 0.999:
                 try:
-                    possessions = processor.ball_to_player_assigner.get_ball_possessions()
-                    if possessions and len(possessions) > 0:
-                        latest = possessions[-1]
-                        # expected pair (club1_frac, club2_frac)
-                        raw_c1 = float(latest[0]) if len(latest) > 0 else 0.5
-                        raw_c2 = float(latest[1]) if len(latest) > 1 else 0.5
+                    nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
+                    proc_frame = cv2.resize(frame, (nw, nh))
+                    did_resize = True
+                except Exception:
+                    proc_frame = frame
+                    did_resize = False
 
-                        # clamp and normalize so sum == 1.0 (fractions for this frame)
-                        raw_c1 = max(0.0, min(1.0, raw_c1))
-                        raw_c2 = max(0.0, min(1.0, raw_c2))
-                        s = raw_c1 + raw_c2
-                        if s <= 1e-6:
-                            frac1, frac2 = 0.5, 0.5
+            try:
+                # choose detection vs. tracking-only path
+                if (frame_idx % interval) == 0:
+                    # run full detection+process
+                    cam_frame, proj_frame = processor.process_frame(proc_frame, fps)
+                else:
+                    # run tracking-only process (no detector)
+                    cam_frame, proj_frame = processor.process_without_detection(proc_frame, fps)
+            except Exception:
+                # fallback to safe call
+                try:
+                    cam_frame, proj_frame = processor.process_frame(proc_frame, fps)
+                except Exception:
+                    cam_frame = _make_placeholder_jpeg("Processing error")
+                    proj_frame = _make_placeholder_jpeg("Processing error")
+
+            frame_idx += 1
+
+            # If we processed on a scaled frame, resize outputs back to original size for UI
+            if did_resize:
+                try:
+                    cam_frame = cv2.resize(cam_frame, (w, h))
+                except Exception:
+                    pass
+                try:
+                    proj_frame = cv2.resize(proj_frame, (w, h))
+                except Exception:
+                    pass
+
+            # Update latest possession numbers from the processor's ball assigner (if available)
+            try:
+                possessions = processor.ball_to_player_assigner.get_ball_possessions()
+                if possessions and len(possessions) > 0:
+                    latest = possessions[-1]
+                    raw_c1 = float(latest[0]) if len(latest) > 0 else 0.5
+                    raw_c2 = float(latest[1]) if len(latest) > 1 else 0.5
+                    raw_c1 = max(0.0, min(1.0, raw_c1))
+                    raw_c2 = max(0.0, min(1.0, raw_c2))
+                    s = raw_c1 + raw_c2
+                    if s <= 1e-6:
+                        frac1, frac2 = 0.5, 0.5
+                    else:
+                        frac1, frac2 = raw_c1 / s, raw_c2 / s
+
+                    delta = 1.0 / max(fps, 1e-6)
+                    with poss_seconds_lock:
+                        poss_seconds['club1'] = poss_seconds.get('club1', 0.0) + frac1 * delta
+                        poss_seconds['club2'] = poss_seconds.get('club2', 0.0) + frac2 * delta
+
+                    with poss_lock, poss_seconds_lock:
+                        ssec = poss_seconds.get('club1', 0.0) + poss_seconds.get('club2', 0.0)
+                        if ssec <= 1e-6:
+                            poss_data['club1'] = 0.5
+                            poss_data['club2'] = 0.5
                         else:
-                            frac1, frac2 = raw_c1 / s, raw_c2 / s
+                            poss_data['club1'] = poss_seconds['club1'] / ssec
+                            poss_data['club2'] = poss_seconds['club2'] / ssec
+                        poss_data['timestamp'] = cv2.getTickCount() / cv2.getTickFrequency()
+            except Exception:
+                pass
 
-                        # accumulate possession seconds (delta = 1/fps)
-                        delta = 1.0 / max(fps, 1e-6)
-                        with poss_seconds_lock:
-                            poss_seconds['club1'] = poss_seconds.get('club1', 0.0) + frac1 * delta
-                            poss_seconds['club2'] = poss_seconds.get('club2', 0.0) + frac2 * delta
+            # Rotate projection to vertical orientation to save horizontal space on UI
+            try:
+                proj_frame = cv2.rotate(proj_frame, cv2.ROTATE_90_CLOCKWISE)
+            except Exception:
+                pass
 
-                        # update poss_data snapshots for backward compatibility (normalize seconds -> fractions)
-                        with poss_lock, poss_seconds_lock:
-                            ssec = poss_seconds.get('club1', 0.0) + poss_seconds.get('club2', 0.0)
-                            if ssec <= 1e-6:
-                                poss_data['club1'] = 0.5
-                                poss_data['club2'] = 0.5
-                            else:
-                                poss_data['club1'] = poss_seconds['club1'] / ssec
-                                poss_data['club2'] = poss_seconds['club2'] / ssec
-                            poss_data['timestamp'] = cv2.getTickCount() / cv2.getTickFrequency()
-                except Exception:
-                    # ignore if getter not available or errors
-                    pass
+            # Encode camera frame
+            try:
+                _, cam_buffer = cv2.imencode('.jpg', cam_frame)
+                cam_bytes = cam_buffer.tobytes()
+            except Exception:
+                cam_bytes = _make_placeholder_jpeg("Camera encode error")
 
-                # Rotate projection to vertical orientation to save horizontal space on UI
+            # Encode projection frame
+            try:
+                _, proj_buffer = cv2.imencode('.jpg', proj_frame)
+                proj_bytes = proj_buffer.tobytes()
+            except Exception:
+                proj_bytes = _make_placeholder_jpeg("Projection encode error")
+
+            # Put camera frame in queue (drop old frames if queue is full)
+            try:
+                if cam_bytes:
+                    frame_queue.put(cam_bytes, block=False)
+            except queue.Full:
                 try:
-                    proj_frame = cv2.rotate(proj_frame, cv2.ROTATE_90_CLOCKWISE)
-                except Exception:
-                    pass
-
-                # Encode camera frame
-                try:
-                    _, cam_buffer = cv2.imencode('.jpg', cam_frame)
-                    cam_bytes = cam_buffer.tobytes()
-                except Exception:
-                    cam_bytes = _make_placeholder_jpeg("Camera encode error")
-
-                # Encode projection frame
-                try:
-                    _, proj_buffer = cv2.imencode('.jpg', proj_frame)
-                    proj_bytes = proj_buffer.tobytes()
-                except Exception:
-                    proj_bytes = _make_placeholder_jpeg("Projection encode error")
-
-                # Put camera frame in queue (drop old frames if queue is full)
-                try:
-                    if cam_bytes:
-                        frame_queue.put(cam_bytes, block=False)
-                except queue.Full:
-                    try:
-                        frame_queue.get_nowait()
-                        frame_queue.put(cam_bytes, block=False)
-                    except:
-                        pass
-
-                # Put projection frame in its queue (drop old frames if queue is full)
-                try:
-                    if proj_bytes:
-                        proj_frame_queue.put(proj_bytes, block=False)
-                except queue.Full:
-                    try:
-                        proj_frame_queue.get_nowait()
-                        proj_frame_queue.put(proj_bytes, block=False)
-                    except:
-                        pass
-
-            except Exception as e:
-                # Log the full traceback, mark processing as stopped and push placeholder frames
-                logging.error("Exception in process_video_stream: %s", e)
-                traceback.print_exc()
-                with processing_lock:
-                    processing_active = False
-
-                # push visible placeholders so client sees an error frame instead of blank
-                err_cam = _make_placeholder_jpeg("Processing error", 640, 360)
-                err_proj = _make_placeholder_jpeg("Processing error", 640, 360)
-                try:
-                    frame_queue.put(err_cam, block=False)
+                    frame_queue.get_nowait()
+                    frame_queue.put(cam_bytes, block=False)
                 except:
                     pass
+
+            # Put projection frame in its queue (drop old frames if queue is full)
+            try:
+                if proj_bytes:
+                    proj_frame_queue.put(proj_bytes, block=False)
+            except queue.Full:
                 try:
-                    proj_frame_queue.put(err_proj, block=False)
+                    proj_frame_queue.get_nowait()
+                    proj_frame_queue.put(proj_bytes, block=False)
                 except:
                     pass
-                break
 
     finally:
         cap.release()
@@ -285,7 +334,7 @@ def index():
 @app.route('/upload', methods=['POST'])
 def upload_video():
     """Handle video upload and start processing"""
-    global processing_active, club_colors, poss_seconds, current_processor
+    global processing_active, club_colors, poss_seconds, current_processor, processing_mode, input_scale
 
     if 'video' not in request.files:
         return jsonify({'error': 'No video file provided'}), 400
@@ -317,12 +366,33 @@ def upload_video():
     filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
     file.save(filepath)
 
+    # get initial optimization settings from form (if provided)
+    try:
+        fm_mode = request.form.get('processing_mode', None)
+        if fm_mode:
+            fm_mode = fm_mode.lower()
+            if fm_mode in ('quality', 'balanced', 'speed'):
+                with processing_mode_lock:
+                    processing_mode = fm_mode
+    except Exception:
+        pass
+
+    try:
+        fm_scale = request.form.get('input_scale', None)
+        if fm_scale:
+            sf = float(fm_scale)
+            with input_scale_lock:
+                input_scale = max(0.2, min(1.0, sf))
+    except Exception:
+        pass
+
     # Initialize processor
     try:
         processor = initialize_processor(
             club1_name, club1_color, club1_gk_color,
             club2_name, club2_color, club2_gk_color,
-            obj_conf, ball_conf, field_conf, kp_conf
+            obj_conf, ball_conf, field_conf, kp_conf,
+            draw_kp=draw_keypoints
         )
 
         # store chosen club colors for the web UI
@@ -332,6 +402,21 @@ def upload_video():
 
         # set global current processor so we can export logs later
         current_processor = processor
+
+        # apply initial values to processor
+        with input_scale_lock:
+            try:
+                processor.input_scale = float(input_scale)
+            except Exception:
+                processor.input_scale = 1.0
+        with processing_mode_lock:
+            # detection_interval kept in processor for potential use; main loop decides interval
+            if processing_mode == 'quality':
+                processor.detection_interval = 1
+            elif processing_mode == 'balanced':
+                processor.detection_interval = 3
+            else:
+                processor.detection_interval = 5
 
         # Temporary initialization: give each team 30 seconds possession at load
         with poss_seconds_lock:
@@ -521,6 +606,61 @@ def draw_keypoints_api():
     else:
         with draw_keypoints_lock:
             return jsonify({'draw_keypoints': draw_keypoints})
+
+# New endpoints: processing_mode and input_scale
+@app.route('/processing_mode', methods=['GET', 'POST'])
+def processing_mode_api():
+    """GET/POST to control processing mode (quality | balanced | speed)"""
+    global processing_mode
+    if request.method == 'POST':
+        mode = None
+        try:
+            data = request.get_json(silent=True)
+            if isinstance(data, dict) and 'mode' in data:
+                mode = data['mode']
+        except Exception:
+            mode = None
+        if mode is None:
+            mode = request.form.get('processing_mode', None)
+        if mode is None:
+            return jsonify({'error': 'no mode supplied'}), 400
+        mode = str(mode).lower()
+        if mode not in ('quality', 'balanced', 'speed'):
+            return jsonify({'error': 'invalid mode'}), 400
+        with processing_mode_lock:
+            processing_mode = mode
+        return jsonify({'success': True, 'processing_mode': processing_mode})
+    else:
+        with processing_mode_lock:
+            return jsonify({'processing_mode': processing_mode})
+
+@app.route('/input_scale', methods=['GET', 'POST'])
+def input_scale_api():
+    """GET/POST to control input resolution scale applied before detection/tracking (0.25 .. 1.0)"""
+    global input_scale
+    if request.method == 'POST':
+        val = None
+        try:
+            data = request.get_json(silent=True)
+            if isinstance(data, dict) and 'scale' in data:
+                val = float(data['scale'])
+        except Exception:
+            val = None
+        if val is None:
+            s = request.form.get('input_scale', None)
+            if s is None:
+                return jsonify({'error': 'no scale supplied'}), 400
+            try:
+                val = float(s)
+            except Exception:
+                return jsonify({'error': 'invalid scale'}, 400)
+        val = max(0.2, min(1.0, float(val)))
+        with input_scale_lock:
+            input_scale = val
+        return jsonify({'success': True, 'input_scale': input_scale})
+    else:
+        with input_scale_lock:
+            return jsonify({'input_scale': input_scale})
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000, threaded=True)

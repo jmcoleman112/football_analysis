@@ -90,6 +90,14 @@ class FootballVideoProcessor(AbstractAnnotator, AbstractVideoProcessor):
         else:
             self._timing_path = None
 
+        # --- processing/optimization configuration (can be toggled live) ---
+        # scale factor applied to input frames before running detection/tracking (0.25 .. 1.0)
+        self.input_scale: float = 1.0
+        # interval (in frames) between runs of the detector. 1 = every frame.
+        self.detection_interval: int = 1
+        # internal counter used if caller prefers processor-managed skipping (optional)
+        self._frames_since_detect: int = 0
+
     def process(self, frames: List[np.ndarray], fps: float = 1e-6) -> List[np.ndarray]:
         self.cur_fps = max(fps, 1e-6)
 
@@ -508,3 +516,99 @@ class FootballVideoProcessor(AbstractAnnotator, AbstractVideoProcessor):
                 # never crash the processor on logging failure
                 pass
 
+    def process_without_detection(self, frame: np.ndarray, fps: float = 30.0) -> np.ndarray:
+        """
+        Process a frame without running the detectors (use trackers' prediction/update step).
+        This method mirrors the tracking/post-processing/annotation pipeline but skips calling
+        obj_tracker.detect / kp_tracker.detect. Useful for running detection every N frames
+        and tracking between.
+        """
+        self.cur_fps = max(fps, 1e-6)
+
+        t0 = time.perf_counter()
+
+        # small pre-processing time (trivial)
+        t_pre_end = time.perf_counter()
+        pre_time = t_pre_end - t0
+
+        # Tracking step WITHOUT fresh detections. We call track with an empty list/dict.
+        t_mid_start = time.perf_counter()
+        try:
+            # trackers are expected to handle empty lists/dicts as "no detection" and perform
+            # prediction / association internally.
+            obj_tracks = self.obj_tracker.track([])
+        except Exception:
+            # fallback: if track expects previous detection object, return empty dict
+            obj_tracks = {}
+
+        try:
+            kp_tracks = self.kp_tracker.track([])
+        except Exception:
+            kp_tracks = {}
+
+        # Assign clubs and map positions as usual
+        try:
+            obj_tracks = self.club_assigner.assign_clubs(frame, obj_tracks)
+        except Exception:
+            pass
+
+        all_tracks = {'object': obj_tracks, 'keypoints': kp_tracks}
+        try:
+            all_tracks = self.obj_mapper.map(all_tracks)
+        except Exception:
+            pass
+
+        try:
+            all_tracks['object'], _ = self.ball_to_player_assigner.assign(
+                all_tracks['object'], self.frame_num,
+                all_tracks['keypoints'].get(8, None),
+                all_tracks['keypoints'].get(24, None)
+            )
+        except Exception:
+            pass
+
+        try:
+            all_tracks['object'] = self.speed_estimator.calculate_speed(
+                all_tracks['object'], self.frame_num, self.cur_fps
+            )
+        except Exception:
+            pass
+
+        if self.save_tracks_dir:
+            try:
+                self._save_tracks(all_tracks)
+            except Exception:
+                pass
+
+        t_mid_end = time.perf_counter()
+        mid_time = t_mid_end - t_mid_start
+
+        self.frame_num += 1
+
+        # Annotate
+        t_annot_start = time.perf_counter()
+        annotated_frame, projection_frame = self.annotate(frame, all_tracks)
+        t_annot_end = time.perf_counter()
+        annot_time = t_annot_end - t_annot_start
+
+        total_time = t_annot_end - t0
+        fps_est = 1.0 / max(total_time, 1e-9)
+
+        # Compose a timing row (approximate inference_s = 0 since we skipped detectors)
+        try:
+            log_row = {
+                'frame_num': int(self.frame_num - 1),
+                'timestamp': float(time.time()),
+                'pre_s': pre_time,
+                'inference_s': 0.0,
+                'mid_s': mid_time,
+                'annotate_s': annot_time,
+                'total_s': total_time,
+                'fps_est': fps_est,
+                'object_count': int(len(all_tracks.get('object', {})))
+            }
+            self._append_timing(log_row)
+        except Exception:
+            pass
+
+        return annotated_frame, projection_frame
