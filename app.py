@@ -220,6 +220,9 @@ def process_video_stream(video_path, processor):
                     proc_frame = frame
                     did_resize = False
 
+            # ---------- Safe processing + robust resize/rotate/encode ----------
+            cam_frame = None
+            proj_frame = None
             try:
                 # choose detection vs. tracking-only path
                 if (frame_idx % interval) == 0:
@@ -238,16 +241,21 @@ def process_video_stream(video_path, processor):
 
             frame_idx += 1
 
-            # If we processed on a scaled frame, resize outputs back to original size for UI
+            # Helper: only resize if numpy array; otherwise leave bytes as-is or provide placeholder
+            def maybe_resize(frame_obj, target_w, target_h):
+                if isinstance(frame_obj, (bytes, bytearray)):
+                    return frame_obj
+                if not isinstance(frame_obj, np.ndarray):
+                    return _make_placeholder_jpeg("Invalid frame")
+                try:
+                    return cv2.resize(frame_obj, (target_w, target_h))
+                except Exception:
+                    return frame_obj
+
+            # Resize outputs back to original display size only for ndarray frames
             if did_resize:
-                try:
-                    cam_frame = cv2.resize(cam_frame, (w, h))
-                except Exception:
-                    pass
-                try:
-                    proj_frame = cv2.resize(proj_frame, (w, h))
-                except Exception:
-                    pass
+                cam_frame = maybe_resize(cam_frame, w, h)
+                proj_frame = maybe_resize(proj_frame, w, h)
 
             # Update latest possession numbers from the processor's ball assigner (if available)
             try:
@@ -283,21 +291,39 @@ def process_video_stream(video_path, processor):
 
             # Rotate projection to vertical orientation to save horizontal space on UI
             try:
-                proj_frame = cv2.rotate(proj_frame, cv2.ROTATE_90_CLOCKWISE)
+                if isinstance(proj_frame, np.ndarray):
+                    proj_frame = cv2.rotate(proj_frame, cv2.ROTATE_90_CLOCKWISE)
+                # if proj_frame is bytes, leave as-is
             except Exception:
                 pass
 
-            # Encode camera frame
+            # Encode camera frame safely (handle both numpy arrays and pre-encoded bytes)
             try:
-                _, cam_buffer = cv2.imencode('.jpg', cam_frame)
-                cam_bytes = cam_buffer.tobytes()
+                if isinstance(cam_frame, (bytes, bytearray)):
+                    cam_bytes = cam_frame if cam_frame else _make_placeholder_jpeg("No camera")
+                elif isinstance(cam_frame, np.ndarray):
+                    ok, cam_buffer = cv2.imencode('.jpg', cam_frame)
+                    if ok:
+                        cam_bytes = cam_buffer.tobytes()
+                    else:
+                        cam_bytes = _make_placeholder_jpeg("Camera encode error")
+                else:
+                    cam_bytes = _make_placeholder_jpeg("Camera invalid")
             except Exception:
                 cam_bytes = _make_placeholder_jpeg("Camera encode error")
 
-            # Encode projection frame
+            # Encode projection frame safely
             try:
-                _, proj_buffer = cv2.imencode('.jpg', proj_frame)
-                proj_bytes = proj_buffer.tobytes()
+                if isinstance(proj_frame, (bytes, bytearray)):
+                    proj_bytes = proj_frame if proj_frame else _make_placeholder_jpeg("No projection")
+                elif isinstance(proj_frame, np.ndarray):
+                    ok, proj_buffer = cv2.imencode('.jpg', proj_frame)
+                    if ok:
+                        proj_bytes = proj_buffer.tobytes()
+                    else:
+                        proj_bytes = _make_placeholder_jpeg("Projection encode error")
+                else:
+                    proj_bytes = _make_placeholder_jpeg("Projection invalid")
             except Exception:
                 proj_bytes = _make_placeholder_jpeg("Projection encode error")
 
