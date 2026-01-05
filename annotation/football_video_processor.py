@@ -98,6 +98,9 @@ class FootballVideoProcessor(AbstractAnnotator, AbstractVideoProcessor):
         # internal counter used if caller prefers processor-managed skipping (optional)
         self._frames_since_detect: int = 0
 
+        # last measured estimated FPS (displayed on annotated frames)
+        self.last_fps_est: float = 0.0
+
     def process(self, frames: List[np.ndarray], fps: float = 1e-6) -> List[np.ndarray]:
         self.cur_fps = max(fps, 1e-6)
 
@@ -161,6 +164,15 @@ class FootballVideoProcessor(AbstractAnnotator, AbstractVideoProcessor):
             infer_time = batch_inference_time / max(len(frames), 1)
 
             fps_est = 1.0 / max(total_time, 1e-9)
+
+            # update last measured fps so it appears on subsequent frames (and next loop)
+            try:
+                self.last_fps_est = float(fps_est)
+            except Exception:
+                pass
+
+            fps_est = float(fps_est)
+            fps_est = fps_est
 
             # Compose log row and write
             try:
@@ -244,6 +256,15 @@ class FootballVideoProcessor(AbstractAnnotator, AbstractVideoProcessor):
         total_time = t_annot_end - t0
         fps_est = 1.0 / max(total_time, 1e-9)
 
+        # update last measured fps so it appears on next frames (and can be shown)
+        try:
+            self.last_fps_est = float(fps_est)
+        except Exception:
+            pass
+
+        fps_est = float(fps_est)
+        fps_est = fps_est
+
         # Write timing row to CSV if configured
         try:
             log_row = {
@@ -284,6 +305,17 @@ class FootballVideoProcessor(AbstractAnnotator, AbstractVideoProcessor):
             heat = self._generate_frame_heatmap(camera_frame, tracks)
             if heat is not None:
                 camera_frame = self._overlay_heatmap(camera_frame, heat)
+
+        # Overlay estimated FPS on the camera frame (top-right)
+        try:
+            fps_text = f'FPS: {float(getattr(self, "last_fps_est", 0.0)):.1f}'
+            # draw black outline for readability
+            cv2.putText(camera_frame, fps_text, (camera_frame.shape[1] - 220, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 0), 4, cv2.LINE_AA)
+            cv2.putText(camera_frame, fps_text, (camera_frame.shape[1] - 220, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 1, cv2.LINE_AA)
+        except Exception:
+            pass
 
         # Return both images separately (camera frame, projection frame)
         return camera_frame, projection_frame
